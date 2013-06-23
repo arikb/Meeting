@@ -541,7 +541,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                               (meeting_id, motion_item_order, motion_text))
             db.commit()
 
-            meeting_singleton._set_current(channel, 'motion', agenda_item_order)
+            meeting_singleton._set_current(channel, 'motion', motion_item_order)
             
             irc.reply("Motion %d added to the current meeting" % motion_item_order)
                 
@@ -642,6 +642,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             """
             
             # get the current meeting ID
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
             if meeting_id is None:
                 irc.error("There is no current meeting in channel %s" % channel)
                 return
