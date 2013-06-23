@@ -1,0 +1,10 @@
+# ignore backups
+*\~
+# ignore compiled python
+*.pyc
+# ignore database files
+*.db
+# ignore log files
+*.log
+*.log.*
+# ignore the config files
