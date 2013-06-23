@@ -104,19 +104,42 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                                   decision_at TIMESTAMP,
                                   
                                   FOREIGN KEY(meeting_id) REFERENCES meeting(id)
-                              )""")            
+                              )""")
+                        
             cursor.execute("""CREATE TABLE currents (
                                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                                   name TEXT,
                                   value INTEGER
                             )""")
+            for current_name in ['meeting', 'agenda', 'motion', 'vote']:
+                cursor.execute("""INSERT INTO currents
+                                  VALUES (NULL, ?, NULL)""", (current_name,))
+            
             db.commit()
 
         return db
 
-    def get_current_meeting_id(self, channel):
+    def _get_current(self, channel, current_name):
         """returns the meeting ID or None if doesn't exist"""
-        return self._current_meeting.get(channel, None)
+        db = self.getDb(channel)
+        cursor = db.cursor()
+        cursor.execute("""SELECT value
+                          FROM currents
+                          WHERE name=?""", (current_name, ))
+        results = cursor.fetchall()
+        if len(results)==0:
+            return None
+
+        return results[0][0]
+
+    def _set_current(self, channel, current_name, value):
+        """returns the meeting ID or None if doesn't exist"""
+        db = self.getDb(channel)
+        cursor = db.cursor()
+        cursor.execute("""UPDATE currents
+                          SET value=?
+                          WHERE name=?""", (value, current_name))
+        db.commit()
 
     def prepare(self, irc, msg, args, channel, meet_name):
         """[<channel>] <meeting name>
@@ -134,8 +157,9 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
         meeting_id = cursor.lastrowid
         db.commit()
 
-        self._current_meeting[channel] = meeting_id
-                
+        # set it as current
+        self._set_current(channel, 'meeting', meeting_id)
+
         irc.reply("Meeting initialised, meeting id %d on channel %s" % (meeting_id, channel))
         
     prepare = wrap(prepare, ['channel', 'text'])
@@ -147,7 +171,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
         """
 
         # get the meeting id
-        meeting_id = self.get_current_meeting_id(channel)
+        meeting_id = self._get_current(channel, 'meeting')
         if meeting_id is None:
             irc.error("No active meeting on channel %s" % channel)
             return
@@ -173,7 +197,11 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                           SET start_time=datetime('now')
                           WHERE id=? """, (meeting_id,))       
         db.commit()
-                
+
+        # initialise the agenda and motion pointers
+        self._set_current(channel, 'agenda', None)
+        self._set_current(channel, 'motion', None)
+
         irc.queueMsg(ircmsgs.topic(channel, meeting_name))
         irc.reply("The meeting has started. Meeting topic: %s (meeting id %d)" % (meeting_name, meeting_id))
         
@@ -186,7 +214,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
         """
 
         # get the meeting id
-        meeting_id = self.get_current_meeting_id(channel)        
+        meeting_id = self._get_current(channel, 'meeting')        
         if meeting_id is None:
             irc.error("No active meeting on channel %s" % channel)
             return
@@ -241,7 +269,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
         meeting_name = results[0][0]
 
         # switch
-        self._current_meeting[channel] = meeting_id
+        self._set_current(channel, 'meeting', meeting_id)
         
         irc.reply("Switched to meeting id %d, meeting name %s" % (meeting_id, meeting_name))
         
@@ -254,7 +282,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
         """
 
         # get the meeting id
-        meeting_id = self.get_current_meeting_id(channel)
+        meeting_id = self._get_current(channel, 'meeting')
         if meeting_id is None:
             irc.reply("Channel %s does not have a current meeting" % channel)
             return
@@ -282,8 +310,6 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             irc.reply("The meeting is currently in progress")
         else:
             irc.reply("The meeting has not started yet")
-            
-        irc.reply("Working with object %s" % repr(self))
         
     status = wrap(status, ['channel'])
 
@@ -310,7 +336,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             """
 
             # get the current meeting ID
-            meeting_id = meeting_singleton.get_current_meeting_id(channel)
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
             if meeting_id is None:
                 irc.error("There is no current meeting in channel %s" % channel)
                 return
@@ -328,6 +354,8 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                               (meeting_id, agenda_item_order, agenda_text))
             db.commit()
             
+            meeting_singleton._set_current(channel, 'agenda', agenda_item_order)
+            
             irc.reply("Agenda item %d added to the current meeting" % agenda_item_order)
                 
         add = wrap(add, ['channel', 'text'])
@@ -338,7 +366,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             List the agenda for the current meeting in the channel
             """
             # get the current meeting ID
-            meeting_id = meeting_singleton.get_current_meeting_id(channel)
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
             if meeting_id is None:
                 irc.error("There is no current meeting in channel %s" % channel)
                 return
@@ -371,7 +399,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             """
             
             # get the current meeting ID
-            meeting_id = meeting_singleton.get_current_meeting_id(channel)
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
             if meeting_id is None:
                 irc.error("There is no current meeting in channel %s" % channel)
                 return
@@ -402,9 +430,74 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                 
             db.commit()
             
+            # handle current item
+            if total_items == 1:
+                # no more agenda items
+                meeting_singleton._set_current(channel, 'agenda', None)
+            else:
+                current_agenda = meeting_singleton._get_current(channel, 'agenda')
+                # was it among the items that were shifted down?
+                if current_agenda > item_id:
+                    meeting_singleton._set_current(channel, 'agenda', current_agenda - 1)
+            
             irc.reply("Agenda item %d has been deleted" % item_id)
             
         delete = wrap(delete, ['channel', 'positiveInt'])
+
+        def next(self, irc, msg, args, channel):
+            """[<channel>]
+            
+            Progresses the agenda to the next item
+            """
+            
+            # get the current meeting ID
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
+            if meeting_id is None:
+                irc.error("There is no current meeting in channel %s" % channel)
+                return
+
+            # get the database
+            db = meeting_singleton.getDb(channel)
+
+            # see how many we have now
+            total_items = self.get_max_item_order(db, meeting_id)
+            if total_items == 0:
+                irc.reply("Current meeting has no agenda.")
+                return
+            
+            # check current item
+            current_item = meeting_singleton._get_current(channel, 'agenda')
+            
+            if current_item == total_items:
+                irc.reply("No more items on the agenda for the current meeting")
+                return
+            
+            # progress to the next item
+            if current_item is None:
+                current_item = 1
+            else:
+                current_item += 1
+
+            # set the new value
+            meeting_singleton._set_current(channel, 'agenda', current_item)
+
+            # get the agenda item
+            cursor = db.cursor()            
+            cursor.execute("""SELECT item_order, item_text
+                              FROM agenda
+                              WHERE meeting_id=?
+                              AND item_order=?""", (meeting_id, current_item))
+            results = cursor.fetchall()
+            if len(results)==0:
+                irc.error("Something went wrong, couldn't retrieve agenda item")
+                return
+            
+
+            # display
+            item_order, item_text = results[0]
+            irc.reply("Current agenda item no. %d: %s" % (item_order, item_text)) 
+            
+        next = wrap(next, ['channel'])
 
     class motion(callbacks.Commands):
 
@@ -425,11 +518,11 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
         def add(self, irc, msg, args, channel, motion_text):
             """[<channel>] motion text...
             
-            Add a motion to the end of the agenda
+            Add a motion
             """
 
             # get the current meeting ID
-            meeting_id = meeting_singleton.get_current_meeting_id(channel)
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
             if meeting_id is None:
                 irc.error("There is no current meeting in channel %s" % channel)
                 return
@@ -447,10 +540,60 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                               NULL, NULL, NULL, NULL)""",
                               (meeting_id, motion_item_order, motion_text))
             db.commit()
+
+            meeting_singleton._set_current(channel, 'motion', agenda_item_order)
             
             irc.reply("Motion %d added to the current meeting" % motion_item_order)
                 
         add = wrap(add, ['channel', 'text'])
+
+        def amend(self, irc, msg, args, channel, motion_text):
+            """[<channel>] motion text...
+            
+            Modify the current motion
+            """
+
+            # get the current meeting ID
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
+            if meeting_id is None:
+                irc.error("There is no current meeting in channel %s" % channel)
+                return
+
+            # get the current motion
+            motion_order = meeting_singleton._get_current(channel, 'motion')
+            if motion_order is None:
+                irc.error("There is no current motion in the current meeting")
+                return
+
+            # get the database
+            db = meeting_singleton.getDb(channel)
+            
+            # check that the motion has not yet been decided
+            cursor = db.cursor()
+            cursor.execute("""SELECT carries
+                              FROM motion
+                              WHERE meeting_id=?
+                              AND item_order=?""", (meeting_id, motion_order))            
+            results = cursor.fetchall()
+            if len(results)==0:
+                irc.error("This shouldn't happen - current motion could not be retrieved")
+                return            
+            if results[0][0] is not None:
+                irc.reply("The motion has already been decided, it cannot be amended")
+                return
+            
+            # update the motion
+            cursor = db.cursor()
+            cursor.execute("""UPDATE motion
+                              SET motion_text=?
+                              WHERE meeting_id=?
+                              AND item_order=?""", (meeting_id, motion_order))
+            db.commit()
+
+            irc.reply("Motion %d has been amended as requested." % motion_item_order)
+                
+        amend = wrap(amend, ['channel', 'text'])
+
 
         def list(self, irc, msg, args, channel):
             """[<channel>]
@@ -458,7 +601,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             List the motions for the current meeting in the channel
             """
             # get the current meeting ID
-            meeting_id = meeting_singleton.get_current_meeting_id(channel)
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
             if meeting_id is None:
                 irc.error("There is no current meeting in channel %s" % channel)
                 return
@@ -499,7 +642,6 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             """
             
             # get the current meeting ID
-            meeting_id = meeting_singleton.get_current_meeting_id(channel)
             if meeting_id is None:
                 irc.error("There is no current meeting in channel %s" % channel)
                 return
@@ -544,12 +686,23 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                                   SET item_order=?
                                   WHERE meeting_id=?
                                   AND item_order=?""", (item-1, meeting_id, item))
+
+            # handle current item
+            if total_items == 1:
+                # no more agenda items
+                meeting_singleton._set_current(channel, 'motion', None)
+            else:
+                current_agenda = meeting_singleton._get_current(channel, 'motion')
+                # was it among the items that were shifted down?
+                if current_agenda > item_id:
+                    meeting_singleton._set_current(channel, 'motion', current_agenda - 1)
                 
             db.commit()
             
             irc.reply("Motion %d has been deleted" % item_id)
             
         delete = wrap(delete, ['channel', 'positiveInt'])
+
 
 Class = Meeting
 
