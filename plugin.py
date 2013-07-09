@@ -41,6 +41,8 @@ import supybot.ircmsgs as ircmsgs
 
 meeting_singleton = None
 
+VALID_VOTE = ['aye', 'nay', 'abstain']
+
 class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
     """This plugin deals with these entities:
     
@@ -56,8 +58,8 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
         callbacks.Plugin.__init__(self, irc)
         plugins.ChannelDBHandler.__init__(self)
         
-        # collect current meeting IDs
-        self._current_meeting = {}
+        # cache channel vote results and verify uniqueness
+        self._voter_decision = {}
         
         # keep a reference to the singleton so that we can reference it from sub commands
         meeting_singleton = self
@@ -98,9 +100,11 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                                   meeting_id INTEGER,
                                   item_order INTEGER,
                                   motion_text TEXT,
-                                  carries BOOLEAN,
+                                  vote_open BOOLEAN,
                                   votes_aye INTEGER,
                                   votes_nay INTEGER,
+                                  votes_abstain INTEGER,
+                                  carries BOOLEAN,
                                   decision_at TIMESTAMP,
                                   
                                   FOREIGN KEY(meeting_id) REFERENCES meeting(id)
@@ -111,6 +115,17 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                                   name TEXT,
                                   value INTEGER
                             )""")
+            
+            cursor.execute("""CREATE TABLE vote (
+                                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                  motion_id INTEGER,
+                                  voter TEXT,
+                                  vote TEXT,
+                                  
+                                  FOREIGN KEY(motion_id) REFERENCES motion(id)
+                            )""")
+            
+            
             for current_name in ['meeting', 'agenda', 'motion', 'vote']:
                 cursor.execute("""INSERT INTO currents
                                   VALUES (NULL, ?, NULL)""", (current_name,))
@@ -140,6 +155,127 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                           SET value=?
                           WHERE name=?""", (value, current_name))
         db.commit()
+
+    def _start_vote_cache(self, channel):
+        """initialise the voter decision cache"""
+        if channel in self._voter_decision:
+            return False
+        
+        # prepare the voter decision cache for the channel
+        self._voter_decision[channel] = {}
+        
+        # get the current meeting ID
+        meeting_id = self._get_current(channel, 'meeting')
+        if meeting_id is None:
+            return False
+        # get the motion order
+        motion_item_order = self._get_current(channel, 'motion')
+        if motion_item_order is None:
+            return False
+        # Get the database        
+        db = self.getDb(channel)
+        
+        # get the motion ID from the database
+        cursor = db.cursor()
+        # update the motion
+        cursor.execute("""UPDATE motion
+                          SET vote_open=1
+                          WHERE meeting_id=?
+                          AND item_order=?""",
+                          (meeting_id, motion_item_order))
+
+        db.commit()
+        return True
+        
+
+    def _end_vote_cache(self, channel):
+        """store the votes in the vote database"""
+        if not channel in self._voter_decision:
+            return
+
+        # get the current meeting ID
+        meeting_id = self._get_current(channel, 'meeting')
+        if meeting_id is None:
+            return
+        # get the motion order
+        motion_item_order = self._get_current(channel, 'motion')
+        if motion_item_order is None:
+            return
+        # Get the database        
+        db = self.getDb(channel)
+        
+        # get the motion ID from the database
+        cursor = db.cursor()
+        cursor.execute("""SELECT id
+                          FROM motion
+                          WHERE meeting_id=?
+                          AND item_order=?""", (meeting_id, motion_item_order))
+        results = cursor.fetchall()
+        if len(results) == 0:
+            return
+        motion_id = results[0][0]
+        
+        # do it
+        cursor = db.cursor()
+        count = {}
+        for vote in VALID_VOTE:
+            count[vote] = 0
+        
+        # insert the lines into the vote table
+        for voter, vote in self._voter_decision[channel].items():
+            cursor.execute("""INSERT INTO vote
+                              VALUES (NULL, ?, ?, ?)""",
+                              (motion_id, voter, vote))
+            count[vote] += 1
+        
+        # update the motion
+        cursor.execute("""UPDATE motion
+                          SET vote_open=0,
+                              votes_aye=?,
+                              votes_nay=?,
+                              votes_abstain=?,
+                              carries=?,
+                              decision_at=datetime('now')
+                          WHERE id=?""",
+                          (count['aye'], count['nay'], count['abstain'],
+                           count['aye'] > count['nay'], motion_id))
+        
+        # done
+        db.commit()
+
+        # delete the local cache
+        del self._voter_decision[channel]
+
+        return (count['aye'], count['nay'], count['abstain'])
+
+    def doPrivmsg(self, irc, msg):
+        """check regular IRC chat for votes"""
+        # check for a regular channel message
+        if ircmsgs.isCtcp(msg) and not ircmsgs.isAction(msg):
+            return
+        channel = msg.args[0]
+        if not irc.isChannel(channel):
+            return
+        
+        # is there an active vote in the channel?
+        if not (channel in self._voter_decision):
+            return
+        
+        # get the text of the vote
+        if ircmsgs.isAction(msg):
+            text = ircmsgs.unAction(msg)
+        else:
+            text = msg.args[1]
+        
+        # is it a vote?
+        if not text in VALID_VOTE:
+            return
+        
+        # get the voter
+        voter = msg.prefix
+
+        # update the cache
+        self._voter_decision[channel][voter] = text
 
     def prepare(self, irc, msg, args, channel, meet_name):
         """[<channel>] <meeting name>
@@ -536,8 +672,8 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             # insert the new item
             cursor = db.cursor()
             cursor.execute("""INSERT INTO motion
-                              VALUES (NULL, ?, ?, ?,
-                              NULL, NULL, NULL, NULL)""",
+                              VALUES (NULL, ?, ?, ?, 0,
+                              NULL, NULL, NULL, NULL, NULL)""",
                               (meeting_id, motion_item_order, motion_text))
             db.commit()
 
@@ -693,10 +829,10 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
                 # no more agenda items
                 meeting_singleton._set_current(channel, 'motion', None)
             else:
-                current_agenda = meeting_singleton._get_current(channel, 'motion')
+                current_motion = meeting_singleton._get_current(channel, 'motion')
                 # was it among the items that were shifted down?
-                if current_agenda > item_id:
-                    meeting_singleton._set_current(channel, 'motion', current_agenda - 1)
+                if current_motion > item_id:
+                    meeting_singleton._set_current(channel, 'motion', current_motion - 1)
                 
             db.commit()
             
@@ -704,6 +840,110 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             
         delete = wrap(delete, ['channel', 'positiveInt'])
 
+
+    class vote(callbacks.Commands):
+
+        def start(self, irc, msg, args, channel):
+            """[<channel>]
+            
+            Start the voting on the current motion
+            """
+
+            # get the current meeting ID
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
+            if meeting_id is None:
+                irc.error("There is no current meeting in channel %s" % channel)
+                return
+
+            # get the current motion
+            motion_item_order = meeting_singleton._get_current(channel, 'motion')
+            if motion_item_order is None:
+                irc.error("There is no current motion in the meeting")
+            
+            # get the database
+            db = meeting_singleton.getDb(channel)
+
+            # get the motion details
+            cursor = db.cursor()
+            cursor.execute("""SELECT motion_text, vote_open, carries 
+                              FROM motion
+                              WHERE meeting_id=?
+                              AND item_order=?""", (meeting_id, motion_item_order))            
+            results = cursor.fetchall()
+
+            if len(results)==0:
+                irc.error("Database error - invalid current motion")
+                return
+
+            motion_text, vote_open, motion_carries = results[0]
+
+            # check that the motion hasn't been decided yet
+            if motion_carries is not None:
+                irc.error("Current motion has already been decided")
+                return
+            if vote_open:
+                irc.error("Voting on the current motion is already open")
+                return
+            
+            # set the vote flag in the singleton
+            meeting_singleton._start_vote_cache(channel)
+
+            irc.reply("Voting open! Please vote aye, nay or abstain for motion: %s" % motion_text)
+                
+        start = wrap(start, ['channel'])
+
+        def end(self, irc, msg, args, channel):
+            """[<channel>]
+            
+            Finishes (and tallies) the vote results
+            """
+
+            # get the current meeting ID
+            meeting_id = meeting_singleton._get_current(channel, 'meeting')
+            if meeting_id is None:
+                irc.error("There is no current meeting in channel %s" % channel)
+                return
+
+            # get the current motion
+            motion_item_order = meeting_singleton._get_current(channel, 'motion')
+            if motion_item_order is None:
+                irc.error("There is no current motion in the meeting")
+            
+            # get the database
+            db = meeting_singleton.getDb(channel)
+
+            # get the motion details
+            cursor = db.cursor()
+            cursor.execute("""SELECT motion_text, vote_open, carries 
+                              FROM motion
+                              WHERE meeting_id=?
+                              AND item_order=?""", (meeting_id, motion_item_order))            
+            results = cursor.fetchall()
+
+            if len(results)==0:
+                irc.error("Database error - invalid current motion")
+                return
+
+            motion_text, vote_open, motion_carries = results[0]
+
+            # check that the motion hasn't been decided yet
+            if motion_carries is not None:
+                irc.error("Current motion has already been decided")
+                return
+            if not vote_open:
+                irc.error("Voting on the current motion has not been started yet")
+                return 
+            
+            # set the vote flag in the singleton
+            result = meeting_singleton._end_vote_cache(channel)
+
+            if result is None:
+                irc.error("Vote counting failed.")
+                return
+            
+            irc.reply("Voting closed - %d aye | %d nay | %d abstained" % result)
+
+        end = wrap(end, ['channel'])
 
 Class = Meeting
 
