@@ -317,7 +317,7 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
 
         # get the meeting details       
         cursor = db.cursor()
-        cursor.execute("""SELECT name
+        cursor.execute("""SELECT name, start_time, end_time
                           FROM meeting
                           WHERE id=?""", (meeting_id, ))
 
@@ -326,7 +326,15 @@ class Meeting(callbacks.Plugin, plugins.ChannelDBHandler):
             irc.error("This shouldn't happen... current meeting id %d invalid" % meeting_id)
             return
         
-        meeting_name = results[0][0]
+        meeting_name, start_time, end_time = results[0]
+        
+        # check for a current meeting and prevent starting it if it's in progress or adjourned
+        if end_time is not None:
+            irc.error("The meeting has already adjourned. Try preparing a new one.")
+            return
+        if start_time is not None:
+            irc.error("This meeting has already started")
+            return
         
         # mark the meeting as started
         cursor.execute("""UPDATE meeting
